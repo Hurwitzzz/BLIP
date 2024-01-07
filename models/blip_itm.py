@@ -1,5 +1,6 @@
 from models.med import BertConfig, BertModel
 from transformers import BertTokenizer
+from adapters import BertAdapterModel
 
 import torch
 from torch import nn
@@ -53,7 +54,7 @@ class BLIP_ITM(nn.Module):
                                        encoder_hidden_states = image_embeds,
                                        encoder_attention_mask = image_atts,      
                                        return_dict = True,
-                                      )
+                                      ) # last_hiddens_state: [batch_size, seq_len, hidden_size](1,35,768)
             itm_output = self.itm_head(output.last_hidden_state[:,0,:])     
             return itm_output
             
