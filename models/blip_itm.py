@@ -1,6 +1,7 @@
 from models.med import BertConfig, BertModel
 from transformers import BertTokenizer
 from adapters import BertAdapterModel
+from adapters import MAMConfig
 
 import torch
 from torch import nn
@@ -28,8 +29,11 @@ class BLIP_ITM(nn.Module):
         self.visual_encoder, vision_width = create_vit(vit,image_size, vit_grad_ckpt, vit_ckpt_layer)
         self.tokenizer = init_tokenizer()   
         med_config = BertConfig.from_json_file(med_config)
-        med_config.encoder_width = vision_width
-        self.text_encoder = BertModel(config=med_config, add_pooling_layer=False)          
+        med_config.encoder_width = vision_width  
+        self.text_encoder = BertModel(config = med_config, add_pooling_layer=False)
+        # self.text_encoder = BertAdapterModel(config=med_config, add_pooling_layer=False)   
+        # adapter_name = self.text_encoder.load_adapter("sentiment/sst-2@ukp", config='pfeiffer')  
+        # self.text_encoder.set_active_adapters(adapter_name)  
 
         text_width = self.text_encoder.config.hidden_size
         

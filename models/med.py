@@ -298,8 +298,8 @@ class BertIntermediate(nn.Module):
             self.intermediate_act_fn = config.hidden_act
 
     def forward(self, hidden_states):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
+        hidden_states = self.dense(hidden_states) # 1,35,768 -> 1,35,3072
+        hidden_states = self.intermediate_act_fn(hidden_states) # 1,35,3072
         return hidden_states
 
 
@@ -310,11 +310,11 @@ class BertOutput(nn.Module):
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states, input_tensor):
+    def forward(self, hidden_states, input_tensor): # hidden_states: 1,35,3072; input_tensor: 1,35,768
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        return hidden_states
+        return hidden_states # 1,35,768
 
 
 class BertLayer(nn.Module):
@@ -366,16 +366,16 @@ class BertLayer(nn.Module):
                 encoder_attention_mask,
                 output_attentions=output_attentions,
             ) # [context_layer, hidden_states(input), (attentions,) present_key_value]
-            attention_output = cross_attention_outputs[0]
+            attention_output = cross_attention_outputs[0] # z, 1,35,768
             outputs = outputs + cross_attention_outputs[1:-1]  # add cross attentions if we output attention weights                               
         layer_output = apply_chunking_to_forward(
             self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
-        )
+        ) # layer_output: z, 1,35,768
         outputs = (layer_output,) + outputs # (z, hidden_states, (attentions))
 
         outputs = outputs + (present_key_value,)
 
-        return outputs # outputs = (z, hidden_states, (attentions), present_key_value)
+        return outputs # outputs = (z, hidden_states, (attentions), present_key_value); 之前似乎错了，应该是(z,present_key_value)
 
     def feed_forward_chunk(self, attention_output):
         intermediate_output = self.intermediate(attention_output)
@@ -389,6 +389,11 @@ class BertEncoder(nn.Module):
         self.config = config
         self.layer = nn.ModuleList([BertLayer(config,i) for i in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
+        self.down_adapter = nn.Linear(config.encoder_width, config.encoder_width//config.reduction_factor)   
+        self.activation = nn.ReLU(inplace=True)       
+        self.up_adapter = nn.Linear(config.encoder_width//config.reduction_factor, config.encoder_width)
+        self.scale_factor = config.scale_factor
+
 
     def forward(
         self,
@@ -403,6 +408,7 @@ class BertEncoder(nn.Module):
         output_hidden_states=False,
         return_dict=True,
         mode='multimodal',
+        adapter_output=None,
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -442,6 +448,11 @@ class BertEncoder(nn.Module):
                     mode=mode,
                 )
             else:
+                if i!=0:
+                    adapter_down_output = self.down_adapter(hidden_states) #1,35,768 -> 1,35,768/16
+                    adapter_nonliner_output = self.activation(adapter_down_output) #1,35,768/16        
+                    adapter_output = self.scale_factor*(self.up_adapter(adapter_nonliner_output)) #1,35,768/16 -> 1,35,768
+
                 layer_outputs = layer_module(
                     hidden_states,  # caption embedding, 1,35,768
                     attention_mask, 
@@ -451,9 +462,10 @@ class BertEncoder(nn.Module):
                     past_key_value,
                     output_attentions,
                     mode=mode,
-                ) # layer_outputs = (z, hidden_states, (attentions), present_key_value);   ([1,35,768], ([1,35,12,64],[1,35,12,64]))
+                ) # layer_outputs = (z, hidden_states, (attentions), present_key_value);   ([1,35,768], ([1,35,12,64],[1,35,12,64])) [1,12,35,64]
 
             hidden_states = layer_outputs[0]
+            hidden_states += adapter_output # 1,35,768 + 1,35,768
             if use_cache:
                 next_decoder_cache += (layer_outputs[-1],)
             if output_attentions:
@@ -588,6 +600,11 @@ class BertModel(BertPreTrainedModel):
 
         self.pooler = BertPooler(config) if add_pooling_layer else None
 
+        self.down_adapter = nn.Linear(config.encoder_width, config.encoder_width//config.reduction_factor) #  
+        self.activation = nn.ReLU(inplace=True)       
+        self.up_adapter = nn.Linear(config.encoder_width//config.reduction_factor, config.encoder_width)
+        self.scale_factor = config.scale_factor
+        
         self.init_weights()
  
 
@@ -777,7 +794,12 @@ class BertModel(BertPreTrainedModel):
             ) # text embedding + position embedding, before self-attention, 1,35,768
         else:
             embedding_output = encoder_embeds
-            
+
+        # Add a parallell adapter 
+        adapter_down_output = self.down_adapter(embedding_output) #1,35,768 -> 1,35,768/16
+        adapter_nonliner_output = self.activation(adapter_down_output) #1,35,768/16        
+        adapter_output = self.scale_factor*(self.up_adapter(adapter_nonliner_output)) #1,35,768/16 -> 1,35,768
+
         encoder_outputs = self.encoder(
             embedding_output,  #caption embedding, 1,35,768
             attention_mask=extended_attention_mask, #1,1,1,35
@@ -790,6 +812,7 @@ class BertModel(BertPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             mode=mode,
+            adapter_output=adapter_output,
         ) # The last hidden state after 12*(self-attention + cross-attention + feed-forward), 1,35,768
         sequence_output = encoder_outputs[0] #1,35,768
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
